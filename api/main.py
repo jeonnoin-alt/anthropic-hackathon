@@ -39,6 +39,9 @@ from graph.spendsentry_graph import (
     render_report,
 )
 
+import admin
+import store
+
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 client = anthropic.Anthropic(api_key=API_KEY) if API_KEY else None
 
@@ -50,12 +53,18 @@ if COMPANY_KEYWORDS:
 
 app = FastAPI(title="SpendSentry API")
 
+# 관리자 인증은 쿠키 기반이라 credentials 허용(origin은 명시 — 와일드카드 동시 사용 불가).
+# Next 프록시 경유 시 동일 origin이라 CORS는 무해.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(admin.router)
+store.init_db()
 
 
 class ChatTurn(BaseModel):
@@ -90,6 +99,26 @@ def _stream_llm(msgs):
             yield text
 
 
+def _capture_report(text: str, structured: dict, violations) -> None:
+    """평가된 지출결의서를 결재 리스트에 적재(best-effort). 실패해도 응답을 막지 않는다."""
+    try:
+        verdict = "FAIL" if violations else "PASS"
+        items = structured.get("items") or []
+        summary = f"지출결의서 · 항목 {len(items)}건"
+        payload = {
+            "input": text,
+            "report": {
+                "items": items,
+                "approval_date": structured.get("approval_date"),
+                "spend_date": structured.get("spend_date"),
+            },
+            "violations": [v.to_dict() for v in violations],
+        }
+        store.insert_submission("report", verdict, summary, None, payload)
+    except Exception:
+        pass
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     msgs = [{"role": m.role, "content": m.content} for m in req.messages if m.content]
@@ -121,7 +150,9 @@ def chat(req: ChatRequest):
             try:
                 structured = _extract_report(last_user, API_KEY, model=CHAT_MODEL)
                 if structured.get("items"):
-                    yield from _chunks(render_report(evaluate_report(structured)))
+                    violations = evaluate_report(structured)
+                    _capture_report(last_user, structured, violations)  # 결재 리스트 적재
+                    yield from _chunks(render_report(violations))
                     return
             except Exception:
                 pass  # 추출 실패 → 대화형 LLM 보고서로 폴백
@@ -149,4 +180,15 @@ async def verify_receipt(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"영수증 판독 실패: {e}")
 
-    return evaluate_receipt(extract.model_dump(), company_keywords=COMPANY_KEYWORDS or None)
+    result = evaluate_receipt(extract.model_dump(), company_keywords=COMPANY_KEYWORDS or None)
+
+    # 결재 리스트 적재 (관리자 페이지용). 적재 실패가 검증 응답을 막지 않도록 best-effort.
+    try:
+        r = result["receipt"]
+        label = r.get("vendor") or r.get("category") or "—"
+        summary = f"영수증 · ₩{(r.get('amount') or 0):,} · {label}"
+        store.insert_submission("receipt", result["verdict"], summary, r.get("amount"), result)
+    except Exception:
+        pass
+
+    return result

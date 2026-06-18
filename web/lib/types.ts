@@ -44,3 +44,46 @@ export type Message =
   | { id: string; kind: "receipt"; role: "assistant"; result: VerifyResult }
   | { id: string; kind: "image"; role: "user"; url: string; name: string }
   | { id: string; kind: "error"; role: "assistant"; content: string; retry: { text: string; file: File | null } };
+
+/** 판정(verdict) 표시 메타 — ReceiptSheet·관리자 페이지 공유. */
+export const VERDICT_META: Record<VerifyResult["verdict"], { bg: string; ink: string; icon: string; title: string }> = {
+  PASS: { bg: "bg-blue-50", ink: "text-toss-blue", icon: "✅", title: "PASS" },
+  FAIL: { bg: "bg-red-50", ink: "text-toss-red", icon: "❌", title: "FAIL" },
+  REVIEW: { bg: "bg-orange-50", ink: "text-toss-yellow", icon: "🔎", title: "검증 불가" },
+};
+
+// ── 관리자 결재 리스트 ──────────────────────────────────────────
+export type SubmissionKind = "receipt" | "report";
+export type SubmissionStatus = "pending" | "approved" | "rejected";
+
+/** 관리자 결재 상태 표시 메타 (라벨·배지 색상). */
+export const STATUS_META: Record<SubmissionStatus, { label: string; cls: string }> = {
+  pending: { label: "대기", cls: "bg-toss-bg text-toss-gray" },
+  approved: { label: "승인", cls: "bg-blue-50 text-toss-blue" },
+  rejected: { label: "반려", cls: "bg-red-50 text-toss-red" },
+};
+
+/** 결재 리스트 행(payload 제외). */
+export interface Submission {
+  id: number;
+  created_at: string;
+  kind: SubmissionKind;
+  verdict: VerifyResult["verdict"];
+  summary: string;
+  amount: number | null;
+  status: SubmissionStatus;
+  memo: string;
+  decided_at: string | null;
+}
+
+/** 결의서 제출 payload(서버 저장 형태). */
+export interface ReportPayload {
+  input: string;
+  report: { items?: unknown[]; approval_date?: string | null; spend_date?: string | null };
+  violations: Violation[];
+}
+
+/** 상세 — receipt면 payload=VerifyResult, report면 payload=ReportPayload. */
+export interface SubmissionDetail extends Submission {
+  payload: VerifyResult | ReportPayload | null;
+}

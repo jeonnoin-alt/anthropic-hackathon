@@ -8,3 +8,7 @@ next-env.d.ts
 
 # TS incremental build cache
 *.tsbuildinfo
+
+# 로컬 결재 제출 SQLite 스토어
+data/
+*.db
