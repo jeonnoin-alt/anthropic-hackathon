@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+anthropic>=0.40
+python-multipart
+pydantic>=2
+langgraph
+Pillow
