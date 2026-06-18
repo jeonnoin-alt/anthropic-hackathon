@@ -8,6 +8,7 @@
 설계 원칙: LLM은 추출·대화만, 판정·금액·날짜·임계 계산은 전부 결정적 코드(graph/).
 """
 
+import logging
 import os
 import sys
 from typing import List
@@ -29,7 +30,7 @@ import anthropic
 from policy import CHAT_MODEL, SYSTEM_PROMPT, VISION_MODEL
 
 from graph.receipt import evaluate_receipt, extract_receipt_image
-from graph.rules import POLICY
+from graph.rules import POLICY, report_verdict
 from graph.spendsentry_graph import (
     REFUSAL,
     _extract_report,
@@ -41,6 +42,8 @@ from graph.spendsentry_graph import (
 
 import admin
 import store
+
+_logger = logging.getLogger("spendsentry.api")
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 client = anthropic.Anthropic(api_key=API_KEY) if API_KEY else None
@@ -99,24 +102,46 @@ def _stream_llm(msgs):
             yield text
 
 
+_ITEM_LABEL = {
+    "meal": "식대", "overtime_taxi": "야근 택시비", "entertainment": "접대비",
+    "travel": "출장비", "purchase": "구매",
+}
+_MEAL_KIND = {"lunch": "점심", "dinner": "저녁", "overtime": "야근"}
+
+
+def _report_item_label(it: dict) -> str:
+    """추출된 결의서 항목(type/kind 기반)에 사람이 읽을 표시명을 부여.
+
+    추출 스키마에는 name/label이 없어, 관리자 상세 화면이 항목명을 그대로 표시할 수 있도록
+    type(→한글 분류)을 매핑한다(없으면 "항목")."""
+    t = it.get("type")
+    base = _ITEM_LABEL.get(t, "항목")
+    if t == "meal" and it.get("kind") in _MEAL_KIND:
+        return f"{base}({_MEAL_KIND[it['kind']]})"
+    if t == "purchase" and it.get("supplier"):
+        return f"{base} · {it['supplier']}"
+    return base
+
+
 def _capture_report(text: str, structured: dict, violations) -> None:
     """평가된 지출결의서를 결재 리스트에 적재(best-effort). 실패해도 응답을 막지 않는다."""
     try:
-        verdict = "FAIL" if violations else "PASS"
         items = structured.get("items") or []
+        # 항목별 표시명 부여 — 관리자 상세의 '지출 항목' 표가 type만으로도 의미를 갖도록.
+        labeled = [{**it, "name": _report_item_label(it)} for it in items if isinstance(it, dict)]
         summary = f"지출결의서 · 항목 {len(items)}건"
         payload = {
             "input": text,
             "report": {
-                "items": items,
+                "items": labeled,
                 "approval_date": structured.get("approval_date"),
                 "spend_date": structured.get("spend_date"),
             },
             "violations": [v.to_dict() for v in violations],
         }
-        store.insert_submission("report", verdict, summary, None, payload)
+        store.insert_submission("report", report_verdict(violations), summary, None, payload)
     except Exception:
-        pass
+        _logger.warning("결의서 결재 적재 실패", exc_info=True)
 
 
 @app.post("/api/chat")
@@ -189,6 +214,6 @@ async def verify_receipt(file: UploadFile = File(...)):
         summary = f"영수증 · ₩{(r.get('amount') or 0):,} · {label}"
         store.insert_submission("receipt", result["verdict"], summary, r.get("amount"), result)
     except Exception:
-        pass
+        _logger.warning("영수증 결재 적재 실패", exc_info=True)
 
     return result

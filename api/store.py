@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -31,6 +32,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")  # 동시 쓰기 잠금 시 최대 30s 대기
     return conn
 
 
@@ -40,7 +42,7 @@ def _now() -> str:
 
 def init_db() -> None:
     """테이블 생성(존재하면 무시). 모듈 import 시 1회 호출된다."""
-    with _connect() as conn:
+    with closing(_connect()) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS submissions (
@@ -62,7 +64,7 @@ def init_db() -> None:
 def insert_submission(kind: str, verdict: str, summary: str,
                       amount: Optional[int], payload: dict) -> int:
     """제출 1건 적재 후 id 반환."""
-    with _connect() as conn:
+    with closing(_connect()) as conn, conn:
         cur = conn.execute(
             "INSERT INTO submissions (created_at, kind, verdict, summary, amount, payload) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -80,7 +82,7 @@ def list_submissions(status: Optional[str] = None, kind: Optional[str] = None,
             clauses.append(f"{col} = ?")
             params.append(val)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         rows = conn.execute(
             "SELECT id, created_at, kind, verdict, summary, amount, status, memo, decided_at "
             f"FROM submissions {where} ORDER BY id DESC",
@@ -91,7 +93,7 @@ def list_submissions(status: Optional[str] = None, kind: Optional[str] = None,
 
 def get_submission(submission_id: int) -> Optional[dict]:
     """단건 상세(payload JSON 파싱 포함). 없으면 None."""
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         row = conn.execute(
             "SELECT * FROM submissions WHERE id = ?", (submission_id,)
         ).fetchone()
@@ -104,7 +106,8 @@ def get_submission(submission_id: int) -> Optional[dict]:
 
 def update_submission(submission_id: int, status: Optional[str] = None,
                       memo: Optional[str] = None) -> Optional[dict]:
-    """관리자 결정(status)·메모 갱신. status가 바뀌면 decided_at을 기록한다.
+    """관리자 결정(status)·메모 갱신. 종결 결정(승인/반려)이면 decided_at을 기록하고,
+    pending으로 되돌리면(결정 취소) decided_at을 비운다.
 
     대상이 없으면 None, status 값이 부적절하면 ValueError.
     """
@@ -114,7 +117,8 @@ def update_submission(submission_id: int, status: Optional[str] = None,
     sets, params = [], []
     if status is not None:
         sets += ["status = ?", "decided_at = ?"]
-        params += [status, _now()]
+        # pending(재오픈)은 '결재 완료' 시각이 아니므로 decided_at을 초기화한다.
+        params += [status, _now() if status != "pending" else None]
     if memo is not None:
         sets.append("memo = ?")
         params.append(memo)
@@ -122,7 +126,7 @@ def update_submission(submission_id: int, status: Optional[str] = None,
         return get_submission(submission_id)
 
     params.append(submission_id)
-    with _connect() as conn:
+    with closing(_connect()) as conn, conn:
         cur = conn.execute(
             f"UPDATE submissions SET {', '.join(sets)} WHERE id = ?", params
         )

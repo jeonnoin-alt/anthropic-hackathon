@@ -30,6 +30,10 @@ _warned_weak_secret = False
 COOKIE_NAME = "sps_admin"
 TOKEN_TTL = 12 * 60 * 60  # 12시간
 MIN_DERIVED_SECRET_LEN = 16  # 비밀번호 파생 서명키로 충분한 최소 길이
+_PBKDF2_ITERS = 100_000     # 비밀번호 파생 시 신장 강도 (오프라인 역산 비용)
+_PBKDF2_SALT = b"sps-admin-cookie-v1"
+_LOGIN_FAIL_DELAY = 0.5     # 실패 로그인 지연(초) — 무차별 대입 속도 완화
+_key_cache: dict[str, bytes] = {}  # 파생 키 캐시 (요청마다 pbkdf2 재계산 방지)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -43,21 +47,36 @@ def _secret() -> bytes:
     """쿠키 서명 비밀키. 전용 시크릿이 없으면 비밀번호에서 파생한다
     (비밀번호가 바뀌면 기존 세션이 자동 무효화된다).
 
-    전용 시크릿 없이 짧은 비밀번호로 파생하면, 서명 메시지가 평문 타임스탬프(알려진 평문)라
-    탈취된 쿠키로 서명키를 오프라인 역산할 수 있다 → 세션 무결성이 비밀번호 엔트로피에 묶인다.
-    이 경우 1회 경고한다(운영 환경에서는 강한 ADMIN_SESSION_SECRET 설정을 권장)."""
+    전용 시크릿 없이 비밀번호로 파생할 때는, 서명 메시지가 평문 타임스탬프(알려진 평문)라
+    탈취된 쿠키로 서명키를 오프라인 역산당할 수 있다. 이를 비싸게 만들기 위해 비밀번호
+    파생 경로는 PBKDF2(SHA-256, _PBKDF2_ITERS회)로 신장한다. 짧은 비밀번호면 1회 경고도
+    남긴다(운영 환경에서는 길고 무작위한 ADMIN_SESSION_SECRET 설정을 권장)."""
     global _warned_weak_secret
     dedicated = os.environ.get("ADMIN_SESSION_SECRET")
     pw = _password() or ""
+    raw = dedicated or pw
+    cache_key = ("D:" if dedicated else "P:") + raw
+    cached = _key_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     if not dedicated and pw and len(pw) < MIN_DERIVED_SECRET_LEN and not _warned_weak_secret:
         _warned_weak_secret = True
         _logger.warning(
-            "ADMIN_SESSION_SECRET 미설정 — 쿠키 서명키를 짧은 ADMIN_PASSWORD(%d자)에서 파생합니다. "
-            "탈취된 관리자 쿠키로 서명키를 역산당할 수 있으니, 운영 환경에서는 길고 무작위한 "
-            "ADMIN_SESSION_SECRET(>=%d자)를 설정하세요.", len(pw), MIN_DERIVED_SECRET_LEN,
+            "ADMIN_SESSION_SECRET 미설정 — 쿠키 서명키를 ADMIN_PASSWORD(%d자)에서 PBKDF2로 파생합니다. "
+            "운영 환경에서는 길고 무작위한 ADMIN_SESSION_SECRET(>=%d자)를 설정하세요.",
+            len(pw), MIN_DERIVED_SECRET_LEN,
         )
-    raw = dedicated or pw
-    return ("sps:" + raw).encode("utf-8")
+
+    material = ("sps:" + raw).encode("utf-8")
+    if dedicated:
+        # 전용 시크릿은 고엔트로피로 가정 — 그대로 사용.
+        key = material
+    else:
+        # 비밀번호 파생 — PBKDF2로 신장해 탈취 쿠키의 오프라인 역산을 비싸게 만든다.
+        key = hashlib.pbkdf2_hmac("sha256", material, _PBKDF2_SALT, _PBKDF2_ITERS)
+    _key_cache[cache_key] = key
+    return key
 
 
 def _sign(msg: str) -> str:
@@ -104,6 +123,8 @@ def login(req: LoginRequest, response: Response):
     if not expected:
         raise HTTPException(status_code=503, detail="관리자 비밀번호가 설정되어 있지 않습니다.")
     if not hmac.compare_digest(req.password, expected):
+        # 단일 비밀번호 게이트 — 실패 시 짧게 지연해 무차별 대입 처리율을 낮춘다.
+        time.sleep(_LOGIN_FAIL_DELAY)
         raise HTTPException(status_code=401, detail="비밀번호가 올바르지 않습니다.")
     response.set_cookie(
         key=COOKIE_NAME,
@@ -119,7 +140,14 @@ def login(req: LoginRequest, response: Response):
 
 @router.post("/logout")
 def logout(response: Response):
-    response.delete_cookie(COOKIE_NAME, path="/")
+    # set_cookie와 동일한 속성으로 삭제 — 일부 브라우저의 '쿠키 미삭제' 버그 회피.
+    response.delete_cookie(
+        COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=os.environ.get("ADMIN_COOKIE_SECURE") == "1",
+    )
     return {"ok": True}
 
 
